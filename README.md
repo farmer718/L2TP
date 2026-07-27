@@ -14,6 +14,14 @@
 
 ## 使用方法
 
+一键执行：
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh)
+```
+
+或手动下载执行：
+
 ```bash
 chmod +x l2tp_deploy.sh
 sudo ./l2tp_deploy.sh
@@ -24,17 +32,14 @@ sudo ./l2tp_deploy.sh
 | 项目 | 值 |
 |------|-----|
 | L2TP 端口 | 1701 |
-| 本地 IP | 10.10.99.1 |
-| 分配 IP 范围 | 10.10.99.10 - 10.10.99.50 |
-| 用户名 | vps_a_user |
-| 密码 | vps_a_pass |
+| 本地 IP | 10.10.{VPN_ID}.1 |
+| 分配 IP 范围 | 10.10.{VPN_ID}.10 - 10.10.{VPN_ID}.50 |
+| 用户名 | farmer |
+| 密码 | chp1qaz!QAZ |
 
 ## 自定义
 
-部署前请修改脚本中的以下内容：
-
-- `/etc/ppp/chap-secrets` 中的用户名和密码
-- `/etc/xl2tpd/xl2tpd.conf` 中的 IP 范围
+脚本运行时会提示输入 VPN_ID (1-200)，自动生成对应网段。如需修改用户名密码，请编辑脚本中 `/etc/ppp/chap-secrets` 部分。
 
 ## 客户端连接
 
