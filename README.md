@@ -94,5 +94,5 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_b_exit
 下载地址：
 
 ```bash
-wget https://raw.githubusercontent.com/farmer718/L2TP/main/PanabitOEM_TANGr7p9_20260622_Linux3.tar.gz
+wget https://raw.githubusercontent.com/farmer718/L2TP/main/PanabitFREE_TANGr7p9_20260622_Linux3.tar.gz
 ```
