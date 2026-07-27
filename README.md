@@ -51,17 +51,17 @@ sudo ./l2tp_deploy.sh
 
 ## NAT 转发（A 通过 B 上网）
 
-A 机器作为 NAT 入口，将流量转发到 B 机器（香港出口），实现通过 B 上网。
+A 机器作为 NAT 入口，将流量转发到 B 机器（香港出口），实现通过 B 上网。当前脚本为 **UDP** 转发。
 
 ### 架构
 
 ```
-客户端 → A(监听端口) → DNAT/SNAT → B(香港出口) → 互联网
+客户端 → A(监听UDP端口) → DNAT/SNAT → B(香港出口) → 互联网
 ```
 
 ### A 机器配置（nat_a_entry.sh）
 
-在 A 机器上执行，配置 DNAT + SNAT 转发规则。
+在 A 机器上执行，配置 UDP DNAT + SNAT 转发规则。
 
 一键执行：
 
@@ -70,13 +70,13 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 ```
 
 运行时需输入：
-- A 监听端口（客户端访问的端口）
+- A 监听 UDP 端口
 - B 香港公网 IP
-- B 目标端口
+- B 目标 UDP 端口
 
 ### B 机器配置（nat_b_exit.sh）
 
-在 B 机器（香港）上执行，配置出口 SNAT 和转发规则。
+在 B 机器（香港）上执行，配置 UDP 出口 SNAT 和转发规则。
 
 一键执行：
 

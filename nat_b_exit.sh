@@ -1,9 +1,9 @@
 #!/bin/bash
 
-echo "=============================="
-echo " B机器 香港出口配置"
-echo " SNAT出口"
-echo "=============================="
+echo "================================"
+echo " B机器 UDP出口配置"
+echo " SNAT"
+echo "================================"
 
 
 if [ "$EUID" -ne 0 ]; then
@@ -15,8 +15,6 @@ fi
 read -p "请输入B公网出口网卡名称(例如eth0): " WAN_IF
 
 
-# 检查网卡
-
 if ! ip link show $WAN_IF >/dev/null 2>&1
 then
     echo "网卡不存在: $WAN_IF"
@@ -24,10 +22,9 @@ then
 fi
 
 
-
 echo ""
 echo "出口网卡:"
-echo $WAN_IF
+echo "$WAN_IF"
 
 
 read -p "确认执行? (y/n): " CONFIRM
@@ -41,41 +38,43 @@ fi
 
 echo "开启IP转发..."
 
-cat >> /etc/sysctl.conf <<EOF
-net.ipv4.ip_forward=1
-EOF
+grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
+echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-sysctl -p
-
+sysctl -w net.ipv4.ip_forward=1
 
 
-echo "添加出口SNAT..."
+
+echo "添加UDP出口SNAT..."
 
 iptables -t nat -A POSTROUTING \
+-p udp \
 -o $WAN_IF \
 -j MASQUERADE
 
 
 
-echo "允许转发..."
+echo "允许UDP转发..."
 
 iptables -A FORWARD \
--i $WAN_IF \
--m state \
---state ESTABLISHED,RELATED \
+-p udp \
+-o $WAN_IF \
 -j ACCEPT
 
 
 iptables -A FORWARD \
--o $WAN_IF \
+-p udp \
+-i $WAN_IF \
+-m conntrack \
+--ctstate ESTABLISHED,RELATED \
 -j ACCEPT
 
 
 
 echo ""
-echo "=============================="
-echo "B配置完成"
-echo "=============================="
+echo "================================"
+echo "B UDP NAT配置完成"
+echo "================================"
 
 
 iptables -t nat -L -n --line-number
