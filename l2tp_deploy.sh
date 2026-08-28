@@ -83,7 +83,7 @@ sysctl -p
 cat << EOF > /etc/xl2tpd/xl2tpd.conf
 
 [global]
-port = 1701
+port = 17001
 
 [lns default]
 ip range = ${IP_RANGE}
