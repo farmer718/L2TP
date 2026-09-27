@@ -12,7 +12,7 @@
 #   sudo ./nat_a_entry.sh --list              列出已有映射
 #   sudo ./nat_a_entry.sh --remove 5000       删掉 A_PORT=5000 那条映射
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 TAG=nat-a
 MAPFILE=/etc/l2tp-nat-a.mappings
@@ -26,6 +26,11 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31m✘\033[0m %s\n' "$*"; FAIL=1; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die()  { printf '\n\033[31m✘ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# 兜底：任何"意外的"失败都要报出行号再退，别让 set -e 静默退出。
+# 上面的 -E（errtrace）让它也能进函数体，否则函数内的失败照样一声不吭。
+# （l2tp_deploy.sh 上因为缺这个吃过一次亏，见那边的 stamp() 注释。）
+trap 'st=$?; printf "\n\033[31m✘ 第 %s 行失败（退出码 %s）—— 上面最后一条输出就是现场\033[0m\n" "$LINENO" "$st" >&2' ERR
 
 # ---------------------------------------------------------------- 规则增删（只增不删）
 

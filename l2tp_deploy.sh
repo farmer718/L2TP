@@ -6,7 +6,7 @@
 #   sudo ./l2tp_deploy.sh 12          指定/更换 VPN_ID（旧网段的 NAT 规则会保留，不删）
 #   sudo DRY_RUN=1 ./l2tp_deploy.sh   只看计划，不动手
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 # ---------------------------------------------------------------- 常量
 
@@ -34,6 +34,15 @@ warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31m✘\033[0m %s\n' "$*"; FAIL=1; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die()  { printf '\n\033[31m✘ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# 兜底：任何"意外的"失败都要报出行号再退。
+# 没有它的时候，set -e 下随便一条裸命令返回非 0 就是【静默退出】——
+# 现场只留一半输出、没有任何错误信息，只能靠猜（就因为这个吃过一次）。
+# 上面的 -E（errtrace）是必须的：不带它 trap 不进函数体，conf_set/backup_once
+# 这类函数内部的失败照样静默退，一行提示都没有。
+# 副作用是顶层赋值调函数时可能重复报 2-3 行，但第一条就指向真凶行。
+# die 路径不受影响：它在 || 列表里，ERR trap 对那种位置有豁免。
+trap 'st=$?; printf "\n\033[31m✘ 第 %s 行失败（退出码 %s）—— 上面最后一条输出就是现场\033[0m\n" "$LINENO" "$st" >&2' ERR
 
 # ---------------------------------------------------------------- 小工具
 
@@ -93,9 +102,11 @@ else
 fi
 
 if [[ -z $VPN_ID && -r $XL_CONF ]]; then
+    # 末尾的 || true 不是多余的：sed | head 在 pipefail 下有 SIGPIPE 竞态
+    # （head 拿到第一行就退出，sed 再写就收 141），而这里是裸赋值 → 会静默退出。
     _n="$(sed -n \
         's/^[[:space:]]*local ip[[:space:]]*=[[:space:]]*10\.10\.\([0-9]\+\)\..*/\1/p' \
-        "$XL_CONF" | head -n1)"
+        "$XL_CONF" | head -n1 || true)"
     if [[ $_n =~ ^[0-9]+$ ]]; then
         VPN_ID="$_n"
         SRC="现存 xl2tpd.conf（自动识别）"
@@ -122,7 +133,7 @@ EXIST_NET=""
 if [[ -r $XL_CONF ]]; then
     EXIST_NET="$(sed -n \
         's/^[[:space:]]*local ip[[:space:]]*=[[:space:]]*\([0-9]\+\.[0-9]\+\.[0-9]\+\)\..*/\1/p' \
-        "$XL_CONF" | head -n1)"
+        "$XL_CONF" | head -n1 || true)"
 fi
 
 echo
@@ -146,9 +157,15 @@ fi
 
 conf_set VPN_ID "$VPN_ID"
 
-# 变更前先指纹，用来判断"重跑但配置没变"→ 就不用断隧道
+# 变更前先指纹，用来判断"重跑但配置没变"→ 就不用断隧道。
+#
+# 坑（2026-09-27 在 61.13.236.126 上踩实）：$UNIT 第一次跑时还不存在（native unit
+# 正是本脚本要装的），cat 有文件读不到就返回 1，pipefail 把它传出来，而
+# OLD_STAMP="$(stamp)" 是裸赋值 —— set -e 当场静默退出，一句错都不打，
+# 表现为"抬头打印完就回到提示符"。所以 cat 的退出码必须在花括号里就地吃掉，
+# 指纹照算"现有的那部分"，函数本身永远返回 0。
 stamp() {
-    cat "$XL_CONF" "$PPP_CONF" "$UNIT" 2>/dev/null \
+    { cat "$XL_CONF" "$PPP_CONF" "$UNIT" 2>/dev/null || true; } \
         | sha256sum | cut -d' ' -f1
 }
 OLD_STAMP="$(stamp)"
@@ -311,7 +328,7 @@ EOF
 systemctl daemon-reload
 systemctl enable xl2tpd >/dev/null 2>&1 || true
 
-FRAG="$(systemctl show xl2tpd -p FragmentPath | cut -d= -f2-)"
+FRAG="$(systemctl show xl2tpd -p FragmentPath | cut -d= -f2- || true)"
 if [[ $FRAG == "$UNIT" ]]; then
     ok "unit 已生效：$FRAG"
 else
@@ -355,8 +372,11 @@ if (( MASQ_N > 1 )); then
     printf '        iptables -t nat -D POSTROUTING <行号> && netfilter-persistent save\n'
 fi
 
-netfilter-persistent save >/dev/null
-ok "iptables 规则已持久化（重启不丢）"
+if netfilter-persistent save >/dev/null; then
+    ok "iptables 规则已持久化（重启不丢）"
+else
+    bad "netfilter-persistent save 失败 —— 重启后 NAT 规则会丢"
+fi
 
 # ---------------------------------------------------------------- 7. 启动
 
@@ -366,8 +386,11 @@ NEW_STAMP="$(stamp)"
 if [[ $OLD_STAMP == "$NEW_STAMP" ]] && systemctl is-active --quiet xl2tpd; then
     ok "配置无变化且服务在跑 —— 跳过重启，隧道不断"
 else
-    systemctl restart xl2tpd
-    ok "已重启 xl2tpd"
+    if systemctl restart xl2tpd; then
+        ok "已重启 xl2tpd"
+    else
+        bad "systemctl restart xl2tpd 失败 —— 见下面自检和日志"
+    fi
 fi
 
 # ---------------------------------------------------------------- 8. 自检
