@@ -1,0 +1,11 @@
+# Shell 脚本一律 LF。
+#
+# 不加这一行的后果：仓库里存什么行尾，就取决于 clone 那台机器的 core.autocrlf。
+# 现在你 Windows 上是 core.autocrlf=true，提交时会把 CRLF 转回 LF，所以 GitHub raw
+# 吐出来是 LF、Linux 上能跑。但这台机器一换、或者谁用 -c core.autocrlf=false 提交，
+# push 上去的就是 CRLF，`bash <(curl ...)` 当场废掉（变量里会混进 \r，配置全是坏的）。
+# 写死 eol=lf 之后，跟 clone 环境无关，磁盘上、仓库里、raw 上都是 LF。
+*.sh text eol=lf
+
+# 其余文本按平台自动处理
+* text=auto
