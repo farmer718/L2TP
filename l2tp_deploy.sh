@@ -384,18 +384,32 @@ fi
 
 step "禁止 needrestart 重启 xl2tpd"
 
-if [[ -d /etc/needrestart/conf.d ]]; then
-    # zz- 前缀保证排在最后，不会被别的 drop-in 覆盖掉 blacklist_rc
-    cat > "$NR_CONF" <<'EOF'
+# 无条件建目录再写。
+#
+# 原来写的是 `if [[ -d /etc/needrestart/conf.d ]]` —— "目录在才写"。在
+# 【先跑脚本、后装 needrestart】的机器上会静默跳过，而且之后再也不会补写。
+# 目录不是 conffile，apt 后来装 needrestart 时它已存在也不冲突，所以直接 mkdir -p
+# 没有副作用（没装 needrestart 的机器上就多一个空目录）。
+#
+# 这条的份量说清楚：装完 native unit 之后，needrestart 再重启 xl2tpd 已经不会把服务
+# 搞死了（那个缺 --retry 的竞态在发行版 sysv init 脚本里，native unit 不用 pidfile）。
+# 所以这个黑名单防的是【白白掐断在线隧道】，不是【防服务躺平】——
+# 漏写的代价是"将来某次系统自动更新，隧道断几秒"，不是灾难。但既然一行就能堵上，就堵上。
+mkdir -p /etc/needrestart/conf.d
+# zz- 前缀保证排在最后，不会被别的 drop-in 覆盖掉 blacklist_rc
+cat > "$NR_CONF" <<'EOF'
 # xl2tpd 是 L2TP 落地服务，重启会掐断所有在线隧道。
 # 它由 systemd (Restart=always) 负责兜底，needrestart 不要碰。
 $nrconf{blacklist_rc} = [
     qr(^xl2tpd),
 ];
 EOF
+# 提示只是提示（文件已经写好了），但别报错话：按 dpkg 的实际安装状态判，
+# 不用 `command -v`（PATH 里没有 /usr/sbin 时会误报"没装"）。
+if dpkg-query -W -f='${Status}' needrestart 2>/dev/null | grep -q 'install ok installed'; then
     ok "已写入 $NR_CONF"
 else
-    warn "没有 /etc/needrestart/conf.d —— needrestart 未安装，本来就不会来重启它"
+    ok "已写入 $NR_CONF（这台还没装 needrestart，先放着，将来装上也生效）"
 fi
 
 # ---------------------------------------------------------------- 6. NAT
