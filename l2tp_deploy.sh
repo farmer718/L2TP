@@ -159,6 +159,15 @@ step "安装依赖"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# needrestart 装完包会弹一个多选框问「重启哪些服务」（模板 needrestart/ui-query_pkgs，
+# 默认档位 restart='i'），而且它【预先勾好】自己想重启的那些。
+# 老机器上此刻 xl2tpd 还在用发行版 sysv unit —— 那个 stop 分支没有 --retry，
+# 一被重启就是本脚本要修的那个竞态，而 native unit 还没装上。
+# 它不是普通的 debconf 提问：非交互模式下 debconf 会拿 needrestart 预置的答案直接返回，
+# 等于"不问、静默重启"，所以 DEBIAN_FRONTEND 挡不住，必须显式静音。
+# apt-pinvoke 在调用 needrestart 之前就检查这个变量，是硬开关。
+export NEEDRESTART_SUSPEND=1
+
 # 新机器上 unattended-upgrades 常常正占着 dpkg 锁，硬等一会儿
 if command -v fuser >/dev/null 2>&1; then
     for i in $(seq 1 60); do

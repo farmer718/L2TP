@@ -183,6 +183,9 @@ if command -v iptables >/dev/null 2>&1 && command -v netfilter-persistent >/dev/
 else
     warn "缺 iptables 或 netfilter-persistent，正在安装…（iptables-persistent 会带上 iptables）"
     export DEBIAN_FRONTEND=noninteractive
+    # 同理：别让 needrestart 装完包弹框重启服务（它是 multiselect 窗口，默认档位交互式，
+    # 非交互时又会拿预置答案静默重启）。中转机上跑，更要免打扰。
+    export NEEDRESTART_SUSPEND=1
 
     if command -v fuser >/dev/null 2>&1; then
         for i in $(seq 1 60); do
