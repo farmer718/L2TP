@@ -2,8 +2,8 @@
 #
 # L2TP (xl2tpd) 落地机部署 —— 幂等，可重复执行
 #
-#   sudo ./l2tp_deploy.sh             首次交互问 VPN_ID；之后读 /etc/l2tp-deploy.conf，全自动
-#   sudo ./l2tp_deploy.sh 12          指定/更换 VPN_ID（旧网段的 NAT 规则会保留，不删）
+#   sudo ./l2tp_deploy.sh             交互运行时问一次 VPN_ID（回车=沿用当前的，输数字=换网段）
+#   sudo ./l2tp_deploy.sh 12          直接指定 VPN_ID，不再问（旧网段的 NAT 规则会保留，不删）
 #   sudo DRY_RUN=1 ./l2tp_deploy.sh   只看计划，不动手
 #
 set -Eeuo pipefail
@@ -90,9 +90,12 @@ backup_once() {
 
 # ---------------------------------------------------------------- 收集参数
 
-# VPN_ID 取值优先级：命令行参数 > /etc/l2tp-deploy.conf > 现存配置里认出来的 > 问人。
-# 老脚本部署过的机器上没有 $CONF，靠第三档自动识别，做到真正的"一键执行"。
+# VPN_ID 的【默认值】来源，优先级：
+#   命令行参数 > /etc/l2tp-deploy.conf > 现存 xl2tpd.conf 自动识别
+# 前三档只负责把默认值填好 —— 交互运行时下面一定会停下来问你，
+# 最终用哪个由你按键决定（换网段会影响线上客户端，不能让脚本替你猜）。
 VPN_ID="${1:-}"
+ARG_ID="$VPN_ID"
 SRC=""
 if [[ -n $VPN_ID ]]; then
     SRC="命令行参数"
@@ -113,12 +116,38 @@ if [[ -z $VPN_ID && -r $XL_CONF ]]; then
     fi
 fi
 
-if [[ -z $VPN_ID ]]; then
-    [[ -t 0 ]] || die "非交互运行且没有 $CONF —— 请传参：$0 <VPN_ID>"
-    read -rp "请输入 VPN_ID (1-200): " VPN_ID
-    SRC="手动输入"
+# 交互运行时【总是】停下来问一次：上面认出来的值当默认值，回车沿用、输数字换网段。
+# 换网段会换掉线上客户端的 IP，这种事必须由人拍板，不能让脚本自己猜。
+#
+# 三种情况【不问】：
+#   ① 命令行给了参数（$0 12）—— 你已经在命令行上决定了，再问一遍是废话；
+#   ② stdin 不是终端（curl | bash、cron、CI）—— 问了也没人答，会卡死；
+#   ③ 上面三档一个都没认出来且非交互 —— 下面直接 die，不猜。
+if [[ -z $ARG_ID && -t 0 ]]; then
+    echo
+    if [[ -n $VPN_ID ]]; then
+        printf ' 当前 VPN_ID : %s   →   网段 10.10.%s.0/24\n' "$VPN_ID" "$VPN_ID"
+        printf ' 来源        : %s\n' "$SRC"
+        printf ' 直接回车保持不变，输入数字则换网段\n'
+    fi
+    while :; do
+        read -rp " VPN_ID (1-200): " _ans || die "读不到输入（终端被关了？）"
+        if [[ -z $_ans ]]; then
+            [[ -n $VPN_ID ]] && break          # 回车 = 沿用默认值
+            echo " 这台机器上没认出 VPN_ID，必须输一个"
+            continue
+        fi
+        [[ $_ans =~ ^[0-9]+$ ]] || { echo " 必须是数字，重新输入"; continue; }
+        _ans=$((10#$_ans))
+        (( _ans >= 1 && _ans <= 200 )) || { echo " 必须在 1-200 之间，重新输入"; continue; }
+        [[ $_ans == "$VPN_ID" ]] || SRC="手动输入${VPN_ID:+（原 $VPN_ID）}"
+        VPN_ID=$_ans
+        break
+    done
+    echo
 fi
 
+[[ -n $VPN_ID ]] || die "非交互运行且没认出 VPN_ID —— 请传参：$0 <VPN_ID>"
 [[ $VPN_ID =~ ^[0-9]+$ ]] || die "VPN_ID 必须是数字，收到：$VPN_ID"
 VPN_ID=$((10#$VPN_ID))                       # 去掉前导零，避免被当八进制
 (( VPN_ID >= 1 && VPN_ID <= 200 )) || die "VPN_ID 必须在 1-200 之间，收到：$VPN_ID"
@@ -409,13 +438,20 @@ if ss -lun 2>/dev/null | grep -qE "[:.]${L2TP_PORT}[[:space:]]"; then
     ok "UDP ${L2TP_PORT} 在监听"
 else
     bad "UDP ${L2TP_PORT} 没在监听"
-    # 常见原因之一：内核没有 l2tp_ppp（OpenVZ / 受限容器加载不了内核模块）
-    if ! lsmod 2>/dev/null | grep -q '^l2tp_ppp'; then
-        printf '      ↳ 内核里没看到 l2tp_ppp 模块。KVM/裸机的官方内核都有，\n'
-        printf '        OpenVZ 或受限容器加载不了它，L2TP 落地起不来。\n'
-        printf '        手工确认：modprobe l2tp_ppp && lsmod | grep l2tp\n'
-    fi
-    printf '      ↳ 也可以直接看：journalctl -u xl2tpd -n 50 --no-pager\n'
+    # 别再往 l2tp_ppp 上引了 —— 那是错的。
+    # xl2tpd 是用户态实现，自己处理 L2TP，再用 pppd 建 ppp 接口，
+    # 【不需要】l2tp_ppp / pppol2tp 内核模块。2026-09-27 在 61.13.236.126 上实测：
+    # 那台机器 modinfo l2tp_ppp 直接 "not found"，/lib/modules/*/kernel/net/l2tp/
+    # 目录都不存在，客户端照样连得上、日志里有 ppp0 Gained carrier。
+    # 真正的前提是 pppd + /dev/ppp。下面直接查这两个，给出能动手的命令。
+    printf '      ↳ 先核对依赖（L2TP 走用户态，不需要 l2tp_ppp 内核模块）：\n'
+    command -v pppd >/dev/null 2>&1 \
+        || printf '        ✘ 没有 pppd —— apt-get install -y ppp\n'
+    [[ -c /dev/ppp ]] \
+        || printf '        ✘ 没有 /dev/ppp —— modprobe ppp_generic（受限容器可能加载不了）\n'
+    printf '      ↳ 依赖没问题的话，就是配置或启动失败，直接看：\n'
+    printf '        journalctl -u xl2tpd -n 50 --no-pager\n'
+    printf '        /usr/sbin/xl2tpd -D -c %s   # 前台跑一遍，报错直接打在屏幕上\n' "$XL_CONF"
 fi
 
 if iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -q "$VPN_CIDR"; then

@@ -1,6 +1,9 @@
 # L2TP & NAT 部署脚本
 
-两个脚本，各一条命令。首次问一次参数，之后重跑全自动、幂等。
+两个脚本，各一条命令，重跑幂等。
+
+落地脚本**每次运行都会停下来问一次 VPN_ID**：直接回车 = 沿用当前网段（就是幂等重跑），
+输个数字 = 换网段。不想要这一步就在命令行上直接给，那就不会再问。
 
 ## ① 落地机 —— L2TP 服务端
 
@@ -16,14 +19,15 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 
 **这两个不会跑在同一台机器上** —— 落地机跑 ①，中转机跑 ②。
 
-跑过老脚本的机器也是直接跑这一条，**不需要先准备什么**：脚本会自己认出正在用的网段。
+跑过老脚本的机器也是直接跑这一条，**不需要先准备什么**：脚本会自己认出正在用的网段，
+填在提问的默认值里，你回车就行。
 
 ### 前提
 
 | 要求 | 说明 |
 |---|---|
 | Debian / Ubuntu | 走 apt；需要 systemd |
-| **KVM 或物理机** | L2TP 走内核态，要 `l2tp_ppp`。**OpenVZ / 受限容器加载不了，起不来** |
+| pppd + `/dev/ppp` | `apt` 装 `xl2tpd` 时会带上 `ppp`。**不需要** `l2tp_ppp` 内核模块 |
 | root | 脚本会检查，不是 root 直接拒绝 |
 | 能连软件源 | 装包用 |
 
@@ -40,7 +44,22 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 | 用户名 | farmer |
 | 密码 | chp1qaz!QAZ |
 
-`VPN_ID` 首次会问你。老脚本的机器会自动从现存的 `xl2tpd.conf` 里认出来，不用输。
+`VPN_ID` 决定用哪个 `10.10.x.0/24` 网段。**每次运行都会问一次**，默认值按这个顺序取：
+
+```
+命令行参数  >  /etc/l2tp-deploy.conf  >  现存 xl2tpd.conf 自动识别
+```
+
+提问时长这样，直接回车用默认值，输数字就换网段：
+
+```
+ 当前 VPN_ID : 12   →   网段 10.10.12.0/24
+ 来源        : 现存 xl2tpd.conf（自动识别）
+ 直接回车保持不变，输入数字则换网段
+ VPN_ID (1-200):
+```
+
+命令行给了参数（`sudo ./l2tp_deploy.sh 12`）就不再问。换网段**不会删旧网段的 NAT 规则**。
 
 ### 跑完会自检
 
@@ -58,7 +77,7 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 # ✅ 进程替换：stdin 还是终端，脚本里的 read 能正常问你
 bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh)
 
-# ✅ 带参数就没有 read 了，管道也安全
+# ✅ 带参数：脚本看 stdin 不是终端就不问了，管道也安全
 curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh | bash -s 11
 
 # ❌ 管道 + 不给参数：read 会去读脚本自身，行为错乱
@@ -67,19 +86,19 @@ curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh | 
 
 第三种现在不会静默出错 —— 检测到 stdin 不是终端又没参数，会直接报错退出。
 
+给参数必须用 `| bash -s 11` 这种写法。`bash <(curl ...) 11` **不行** —— bash 会把
+`11` 当成另一个脚本文件名去读，参数根本传不进去。
+
 最小化系统如果连 `curl` 都没有，先 `apt-get install -y curl`（或 `wget` 下来再跑）。
 
 ## 已经在跑老脚本的机器，直接跑新的会怎样
 
 **直接一键跑就行。** 老机器上没有 `/etc/l2tp-deploy.conf`，脚本会从现存的
-`/etc/xl2tpd/xl2tpd.conf` 里自动认出正在用的网段，不需要你输入，所以也不会填错。
-取值优先级：
+`/etc/xl2tpd/xl2tpd.conf` 里自动认出正在用的网段，摆成提问的默认值 —— **回车即保持原样**，
+所以不会填错。想换网段就当场输数字，或者显式传：`sudo ./l2tp_deploy.sh 12`。
 
-```
-命令行参数 > /etc/l2tp-deploy.conf > 现存 xl2tpd.conf 自动识别 > 问人
-```
-
-想换网段就显式传：`sudo ./l2tp_deploy.sh 12`（传了就以你传的为准）。
+（以前是"认出来就直接用、压根不问"。改成必问是因为换网段会换掉客户端的 IP，
+这种事让脚本替你决定不合适。）
 
 | 项目 | 结果 |
 |---|---|
