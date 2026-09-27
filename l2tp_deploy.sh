@@ -311,16 +311,32 @@ EOF
 chmod 600 "$PPP_CONF"
 ok "xl2tpd.conf（port=${L2TP_PORT}）+ options.xl2tpd（mtu/mru ${MTU}）"
 
-# chap-secrets 只在不存在时写：重跑不会覆盖你手工加过的账号
-if [[ ! -s /etc/ppp/chap-secrets ]]; then
-    cat > /etc/ppp/chap-secrets <<'EOF'
+# chap-secrets：只在【一个有效账号都没有】时补上默认账号；有账号就一个字不动。
+#
+# 坑（2026-09-28 在 218.208.109.112 上踩实，全新机器 100% 中招）：
+# 原来判的是 `[[ ! -s ... ]]`，即"文件不存在或为空才写"。但 Debian/Ubuntu 的 ppp 包
+# 装完就【自带】一份 /etc/ppp/chap-secrets —— 里面只有两行注释 + 两个空行，
+# 文件却是 80 字节，`-s` 判真。于是全新机器永远走 else 分支：一个账号都不写。
+# 症状极具迷惑性：服务 active、17001 在听、自检全绿、L2TP 隧道和 Call 都能建起来，
+# 但 pppd 每次都报
+#     "The remote system is required to authenticate itself
+#      but I couldn't find any suitable secret (password) for it to use to do so."
+# 客户端反复重拨、一次都分不到 IP —— 而"服务是好的"会把排查方向彻底带偏。
+# （老脚本部署过的机器不会暴露，因为 farmer 账号早就在了。）
+#
+# 现在按【有效账号数】判：grep -v 掉注释和空行，还剩东西就认为你手工配过，不碰。
+CHAP_SECRETS=/etc/ppp/chap-secrets
+if [[ -f $CHAP_SECRETS ]] && grep -qvE '^[[:space:]]*(#|$)' "$CHAP_SECRETS"; then
+    warn "chap-secrets 里已有账号，保留不动（不覆盖你手工加的）"
+else
+    # 追加而不是覆盖：ppp 包自带的注释头留着，将来好认
+    [[ -f $CHAP_SECRETS ]] || : > "$CHAP_SECRETS"
+    cat >> "$CHAP_SECRETS" <<'EOF'
 farmer   l2tpd   "chp1qaz!QAZ"   *
 EOF
-    ok "已写入默认 chap-secrets"
-else
-    warn "chap-secrets 已存在，保留不动（想重置请先删掉 /etc/ppp/chap-secrets）"
+    ok "chap-secrets 里原本没有任何账号，已补上默认账号 farmer"
 fi
-chmod 600 /etc/ppp/chap-secrets
+chmod 600 "$CHAP_SECRETS"
 
 # ---------------------------------------------------------------- 4. native unit（根因修复）
 
@@ -464,6 +480,19 @@ if grep -q '^Restart=always' "$UNIT"; then
     ok "unit 带 Restart=always（挂了会自己回来）"
 else
     bad "unit 缺 Restart=always"
+fi
+
+# 这一条是 2026-09-28 补的。没有它的时候，一台 chap-secrets 里一个账号都没有的
+# 机器会报【部署完成、全绿】—— 服务在跑、端口在听、NAT 在位、unit 也对，
+# 唯独没有客户端能连上来。前面每一项都是真的，合起来却是个假绿灯。
+# 自检要挡的就是这种"每一项都真、结论是错"的情况。
+if [[ -f $CHAP_SECRETS ]] && grep -qvE '^[[:space:]]*(#|$)' "$CHAP_SECRETS"; then
+    ok "chap-secrets 里有 $(grep -cvE '^[[:space:]]*(#|$)' "$CHAP_SECRETS") 个账号"
+else
+    bad "chap-secrets 里一个账号都没有 —— 客户端会卡在 PPP 认证，连不上"
+    printf '      ↳ 症状：pppd 报 "couldn'"'"'t find any suitable secret"\n'
+    printf '      ↳ 补一个：echo '"'"'farmer   l2tpd   "chp1qaz!QAZ"   *'"'"' >> %s\n' "$CHAP_SECRETS"
+    printf '        然后 chmod 600 %s\n' "$CHAP_SECRETS"
 fi
 
 # ---------------------------------------------------------------- 结果

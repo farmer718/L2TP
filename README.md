@@ -63,8 +63,13 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 
 ### 跑完会自检
 
-服务 active / 端口监听 / `ip_forward` / NAT 规则 / unit 是否带 `Restart=always`，
-有 ✘ 就以**非 0** 退出。不会再出现"打印了部署完成但其实没成"。
+服务 active / 端口监听 / `ip_forward` / NAT 规则 / unit 是否带 `Restart=always` /
+**`chap-secrets` 里有没有账号**，有 ✘ 就以**非 0** 退出。
+不会再出现"打印了部署完成但其实没成"。
+
+最后那条是 2026-09-28 补的：`ppp` 包装完自带一份只有注释的 `/etc/ppp/chap-secrets`，
+旧版脚本据此认为"文件已存在、不要动"，于是一个账号都不写 —— 服务全绿、端口在听、
+客户端就是连不上，卡在 PPP 认证。见下面「chap-secrets 那个坑」。
 
 ---
 ---
@@ -105,7 +110,7 @@ curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh | 
 | 在线隧道 | ⚠️ **断一次**（几秒，客户端会自动重连）—— 换 native unit 必须重启 |
 | `xl2tpd.conf` | 网段/端口不变，改写前备份到 `/var/backups/l2tp-deploy/` |
 | `options.xl2tpd` | 多出 `mtu/mru 1420`，对实测的 1420 是零改动 |
-| `chap-secrets` | ✅ 原样保留，不覆盖 |
+| `chap-secrets` | ✅ 有账号就**原样保留、一个字不动**；一个账号都没有才补上默认的 |
 | sysctl | 值相同，无变化。老脚本写在 `/etc/sysctl.conf` 的行留着，无害 |
 | `/etc/init.d/xl2tpd` + `rc*.d` 软链 | 留着但失效（`/etc/systemd/system/` 里的 native unit 优先） |
 | NAT 规则 | ⚠️ 老规则没带 `l2tp-deploy` 标记，认不出来 → **会多出一条重复的 MASQUERADE**，无害，脚本会报出来并给出删除命令 |
@@ -114,6 +119,34 @@ curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh | 
 想先看清楚再动手：`sudo DRY_RUN=1 ./l2tp_deploy.sh 11` 只打印计划。
 
 出问题要回滚：`/var/backups/l2tp-deploy/` 里是**第一次跑本脚本之前**的原件。
+
+## chap-secrets 那个坑（2026-09-28 修）
+
+**症状极有迷惑性**：服务 `active`、UDP 17001 在听、`ip_forward=1`、NAT 规则在位、
+自检全绿 —— 但客户端就是连不上，反复重拨，一次都分不到 IP。日志里是：
+
+```
+pppd: The remote system is required to authenticate itself
+pppd: but I couldn't find any suitable secret (password) for it to use to do so.
+```
+
+**原因**：`Debian`/`Ubuntu` 的 `ppp` 包装完就**自带**一份 `/etc/ppp/chap-secrets`，
+里面只有两行注释 + 两个空行。旧版脚本判断的是"文件不存在或是空的才写"，
+而这份自带文件是 80 字节、非空 —— 于是**永远跳过写入，一个账号都没有**。
+每一台全新机器都会中招；老脚本部署过的机器不会，因为账号早就在了。
+
+**现在的行为**：按**有效账号数**判（grep 掉注释和空行）。
+有账号 → 一个字不动，绝不覆盖你手工加的；一个都没有 → 追加默认账号 `farmer`。
+自检里也加了这一条，不会再出现"全绿但连不上"。
+
+手工补（不想重跑脚本的话）：
+
+```bash
+echo 'farmer   l2tpd   "chp1qaz!QAZ"   *' >> /etc/ppp/chap-secrets
+chmod 600 /etc/ppp/chap-secrets
+```
+
+改完不用重启 xl2tpd —— pppd 每次拨号都重新读这个文件。
 
 ## l2tp_deploy.sh 具体做了什么
 
