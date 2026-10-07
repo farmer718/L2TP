@@ -64,11 +64,12 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 ### 跑完会自检
 
 服务 active / 端口监听 / `ip_forward` / NAT 规则 / unit 是否带 `Restart=always` /
-**`chap-secrets` 里有没有账号**，有 ✘ 就以**非 0** 退出。
-不会再出现"打印了部署完成但其实没成"。
+unit 是否声明 `RuntimeDirectory=xl2tpd` / **`chap-secrets` 里有没有账号**，
+有 ✘ 就以**非 0** 退出。不会再出现"打印了部署完成但其实没成"。
 
-最后那条是 2026-09-28 补的。真正的修复在写账号那一步（改成按有效账号数判、没账号就一定写）；
-自检这条是**回归防线**，不是这次的保险 —— 写账号失败时脚本会当场非 0 退出，自检根本轮不到跑。
+后两条是**回归防线**，不是当下的保险 —— 它们要防的 bug 都在更早的写入步骤里，
+那一步失败时 `set -e` 会当场非 0 退出，自检根本轮不到跑（已实测）。
+具体分量：`chap-secrets` 那条 2026-09-28 补，`RuntimeDirectory` 那条 2026-10-07 补。
 它防的是将来有人再往写入那步加"跳过条件"，也就是这个 bug 的原始形状。
 背景见下面「chap-secrets 那个坑」。
 
@@ -163,6 +164,18 @@ chmod 600 /etc/ppp/chap-secrets
   这个竞态**只在服务被重启时触发**，所以全新部署（start）永远不会中招；重跑、自动升级、
   手工 restart 才会。native unit 用 `Type=simple` + `-D` 彻底绕开 pidfile 和这个竞态，
   并带 `Restart=always`。
+
+  换 unit 时还带出过第二个坑（2026-10-07 在 103.197.211.71 上踩实，`up 13 min`
+  就是重启计数 54 次）：**unit 必须声明 `RuntimeDirectory=xl2tpd`。**
+  `/var/run` 是指向 `/run` 的软链、而 `/run` 是 tmpfs，重启即清空；
+  `/var/run/xl2tpd` 这个目录原本由发行版 init 脚本每次 start 时 `mkdir -p`，
+  native unit 把它顶掉之后就再没人建了。缺了它的症状是
+  `open_controlfd: Unable to open /var/run/xl2tpd/l2tp-control for reading.`，
+  退出码 1，被 `Restart=always` + `StartLimitIntervalSec=0` 顶成每 3 秒一次的死循环。
+
+  **形状是"装完全绿、重启即死"**：刚装完自检每一项都是真的（目录还在），
+  唯独重启后服务再也起不来。所以自检里加了一条专门查 unit 有没有声明它 ——
+  这条查的是「重启之后还活着」，不是「现在活着」。
 
 - **禁止 needrestart 重启 xl2tpd。**
 

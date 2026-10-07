@@ -359,6 +359,16 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# /var/run 是指向 /run 的符号链接，而 /run 是 tmpfs —— 重启即清空。
+# 发行版那个 /etc/init.d/xl2tpd 每次 start 都会 mkdir -p /var/run/xl2tpd（第 37/49/57 行），
+# native unit 把它顶掉之后，就再也没人建这个目录了。
+# 缺了它的后果是【装完能跑、一重启就永久躺平】：xl2tpd 报
+#   open_controlfd: Unable to open /var/run/xl2tpd/l2tp-control for reading.
+# 退出码 1，被 Restart=always + StartLimitIntervalSec=0 顶成每 3 秒一次的死循环。
+# 2026-10-07 在 103.197.211.71 上踩实（开机 13 分钟，重启计数已 54 次）。
+# 用 RuntimeDirectory 让 systemd 每次启动前建好，才真正扛得住重启。
+RuntimeDirectory=xl2tpd
+RuntimeDirectoryMode=0755
 ExecStart=/usr/sbin/xl2tpd -D -l -c /etc/xl2tpd/xl2tpd.conf
 Restart=always
 RestartSec=3
@@ -494,6 +504,23 @@ if grep -q '^Restart=always' "$UNIT"; then
     ok "unit 带 Restart=always（挂了会自己回来）"
 else
     bad "unit 缺 Restart=always"
+fi
+
+# 2026-10-07 补：这条查的是【重启之后还活着】，不是【现在活着】。
+# 上面"服务 active"和"端口在听"两项在刚装完的机器上必然全绿 —— /var/run/xl2tpd
+# 要么是发行版 init 脚本早先建的、要么本次就在，唯独重启后才会消失。
+# 所以这个 bug 的形状是【装完全绿、重启即死】，只有查 unit 声明才当场看得出来。
+#
+# 分量别夸大（和上面 chap-secrets 那条同理）：写 unit 那步失败时 set -e 会当场中断，
+# 自检根本轮不到跑 —— 已实测（把 $UNIT 做成目录 → 停在第 351 行，自检一行没打）。
+# 正常流程里这个 bad 分支同样够不着，它防的是【将来有人把 RuntimeDirectory
+# 从模板里删掉】这种回退。
+if grep -q '^RuntimeDirectory=xl2tpd' "$UNIT"; then
+    ok "unit 声明了 RuntimeDirectory=xl2tpd（重启后 /var/run/xl2tpd 会自己回来）"
+else
+    bad "unit 缺 RuntimeDirectory=xl2tpd —— 这台机器一重启 xl2tpd 就永久起不来"
+    printf '      ↳ 症状：journalctl 里刷 open_controlfd: Unable to open /var/run/xl2tpd/l2tp-control\n'
+    printf '      ↳ 成因：/var/run -> /run 是 tmpfs，重启清空；原 sysv init 脚本负责 mkdir，native unit 顶掉后没人建\n'
 fi
 
 # 这一条是 2026-09-28 补的。这个 bug 的形状是【每一项都真、结论是错】：
