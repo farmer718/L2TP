@@ -79,6 +79,19 @@ add_rule() {
     fi
 }
 
+# `cmd | grep -q` 在 set -o pipefail 下是个陷阱：grep -q 命中第一处就退出，
+# cmd 再往管道里写就吃到 SIGPIPE（141），pipefail 把整条管道判成失败。
+# 结果是东西明明在，判断却为假 —— 自检报 ✘、ERR trap 报"第 N 行失败"，
+# 而退出码 141 看着像天书（2026-10-26 落地机实测：ip rule 在，报"缺 fwmark"）。
+# 所以先把输出整个读进变量，再在变量里 grep。
+has_out() {   # has_out [-E|-F] <模式> <命令...>
+    local opt="" pat out
+    case "${1:-}" in -E|-F) opt=$1; shift ;; esac
+    pat=$1; shift
+    out="$("$@" 2>/dev/null || true)"
+    grep $opt -q -- "$pat" <<< "$out"
+}
+
 # ---------------------------------------------------------------- 前置检查
 
 [[ $EUID -eq 0 ]] || die "请用 root 执行：sudo $0"
@@ -88,15 +101,30 @@ add_rule() {
 # 擦除用的旧网段：只认磁盘上已有的痕迹，跟这次要装的新网段无关。
 # 换网段时（`./l2tp_deploy.sh 12`，机器上还是 11）必须删旧的，
 # 拿新值去删等于什么都没删。
-PREV_ID="$(conf_get VPN_ID)"
-if [[ -z $PREV_ID && -r $XL_CONF ]]; then
-    PREV_ID="$(sed -n \
+#
+# 两个来源都要看，不能二选一：/etc/l2tp-deploy.conf 记的是「上次跑到哪一步」，
+# /etc/xl2tpd/xl2tpd.conf 记的是「实际在用的网段」，两者可能对不上 ——
+# 2026-10-26 的 210.68.95.228 就是这样：conf 里写着 20，机器实际跑在 19，
+# 只信 conf 就把 10.10.19.0/24 那条 MASQUERADE 原封不动留在了机器上。
+# 取并集：多删一条不存在的规则是空操作，漏删一条就会一直留着。
+PREV_IDS=""
+_prev="$(conf_get VPN_ID)"
+if [[ $_prev =~ ^[0-9]+$ ]]; then
+    PREV_IDS="$_prev"
+fi
+if [[ -r $XL_CONF ]]; then
+    _prev="$(sed -n \
         's/^[[:space:]]*local ip[[:space:]]*=[[:space:]]*10\.10\.\([0-9]\+\)\..*/\1/p' \
         "$XL_CONF" | head -n1 || true)"
+    if [[ $_prev =~ ^[0-9]+$ && " $PREV_IDS " != *" $_prev "* ]]; then
+        PREV_IDS="$PREV_IDS $_prev"
+    fi
 fi
-[[ $PREV_ID =~ ^[0-9]+$ ]] || PREV_ID=""
-OLD_NET=""
-[[ -n $PREV_ID ]] && OLD_NET="10.10.${PREV_ID}.0/24"
+OLD_NETS=""
+for _id in $PREV_IDS; do
+    OLD_NETS="$OLD_NETS 10.10.${_id}.0/24"
+done
+OLD_NETS="${OLD_NETS# }"
 
 # 默认值来源优先级：命令行参数 > /etc/l2tp-deploy.conf > 现存 xl2tpd.conf 自动识别
 # 交互运行时一定停下来问一次（换网段会换掉线上客户端的 IP，不能替人猜）。
@@ -167,9 +195,11 @@ echo " 客户端池   : ${IP_RANGE}"
 echo " L2TP 端口  : ${L2TP_PORT}  (UDP)"
 echo " MTU / MRU  : ${MTU}"
 echo " xray 入口  : TCP ${TCP_PORT} (REDIRECT) / UDP ${UDP_PORT} (TPROXY)"
-if [[ -n $OLD_NET && $OLD_NET != "$VPN_CIDR" ]]; then
-    echo " ⚠ 旧网段   : ${OLD_NET}  →  本次改成 ${VPN_CIDR}（旧规则先删掉）"
-fi
+for _old in $OLD_NETS; do
+    if [[ $_old != "$VPN_CIDR" ]]; then
+        echo " ⚠ 旧网段   : ${_old}  →  本次改成 ${VPN_CIDR}（旧规则先删掉）"
+    fi
+done
 echo "=========================================="
 echo " 会先删掉这台机器上所有旧的 L2TP / xray 配置，再重装。"
 echo " 在线隧道会断，服务会被重启；不留备份。"
@@ -189,10 +219,17 @@ for p in "$L2TP_PORT" "$TCP_PORT" "$UDP_PORT"; do
     if [[ -z $owner ]]; then
         continue
     fi
-    case "$owner" in
-        *"$XRAY_DIR/xray"*|*xl2tpd*)
+    # ss -p 只给进程名（"xray"），不给路径 —— 光看这一行分不清是 /opt/xray-redir/xray
+    # 还是别处装的 xray。拿 pid 去 /proc 读 exe 才是确定的。
+    pid="$(printf '%s\n' "$owner" | sed -n 's/.*pid=\([0-9]\{1,\}\).*/\1/p' | head -n1 || true)"
+    exe=""
+    if [[ -n $pid && -r /proc/$pid/exe ]]; then
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    fi
+    case "$exe" in
+        "$XRAY_DIR/xray"|*/xl2tpd)
             # 重跑时这两个是自己上一轮留下的，第 1 步会先停掉
-            ok "端口 ${p} 是本脚本自己的服务占着，稍后会被重启"
+            ok "端口 ${p} 是本脚本自己的 ${exe##*/} 占着，稍后会被重启"
             ;;
         *)
             die "端口 ${p} 已被占用，先处理掉再跑：
@@ -224,15 +261,17 @@ if [[ -x $REDIR_SH ]]; then
 fi
 
 # NAT：按旧网段精确删。两种形状都试——带 comment 的（本脚本）和不带的（老脚本）。
-if [[ -n $OLD_NET ]]; then
+if [[ -n $OLD_NETS ]]; then
     n=0
-    while iptables -t nat -D POSTROUTING -s "$OLD_NET" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null; do
-        n=$((n + 1))
+    for _net in $OLD_NETS; do
+        while iptables -t nat -D POSTROUTING -s "$_net" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null; do
+            n=$((n + 1))
+        done
+        while iptables -t nat -D POSTROUTING -s "$_net" -j MASQUERADE 2>/dev/null; do
+            n=$((n + 1))
+        done
     done
-    while iptables -t nat -D POSTROUTING -s "$OLD_NET" -j MASQUERADE 2>/dev/null; do
-        n=$((n + 1))
-    done
-    (( n > 0 )) && ok "已删掉 ${OLD_NET} 的 ${n} 条 MASQUERADE"
+    (( n > 0 )) && ok "已删掉旧网段的 ${n} 条 MASQUERADE（${OLD_NETS}）"
 fi
 
 rm -f "$XRAY_UNIT" "$REDIR_SH" "$UNIT" "$XL_CONF" "$PPP_CONF" "$NR_CONF" "$SYSCTL_CONF"
@@ -248,7 +287,7 @@ warn "chap-secrets 没动（要保留账号）；有重复账号的话自己看�
 # sing-box 的 tun 默认就用 fwmark 1 + table 100，撞上会出事：本脚本会往同一个表里
 # 补一条 local default dev lo，把它原来的 tun 默认路由顶掉。
 # 只报不拦 —— 擦除已经做完了，拦下来也回不去。
-if ip rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100'; then
+if has_out 'fwmark 0x1 lookup 100' ip rule show; then
     warn "ip rule 里还有 fwmark 1 lookup 100 —— 不是本脚本的（本脚本的刚被删掉）"
     warn "可能来自别的透明代理（sing-box tun 默认就是 fwmark 1 + table 100）"
     warn "table 100 现在的内容，脚本会往里加 local default dev lo："
@@ -446,7 +485,7 @@ else
     chmod +x "$XRAY_DIR/xray"
     [[ -x $XRAY_DIR/xray ]] && "$XRAY_DIR/xray" version >/dev/null 2>&1 \
         || die "xray 解包后跑不起来"
-    ok "xray 已安装：$("$XRAY_DIR/xray" version | head -n1)"
+    ok "xray 已安装：$("$XRAY_DIR/xray" version 2>/dev/null | awk 'NR==1')"
 fi
 
 # ---- 7.2 配置：两个 dokodemo-door 入口 + freedom 直出
@@ -633,8 +672,8 @@ ManageForeignRoutingPolicyRules=no
 EOF
 
     # drop-in 要 systemd >= 249。老版本读不到就往主文件里写。
-    if ! systemd-analyze cat-config systemd/networkd.conf 2>/dev/null \
-            | grep -q '^ManageForeignRoutingPolicyRules=no'; then
+    if ! has_out '^ManageForeignRoutingPolicyRules=no' \
+            systemd-analyze cat-config systemd/networkd.conf; then
         warn "systemd 不认 networkd.conf.d，改为直接改 /etc/systemd/networkd.conf"
         if grep -qE '^#?ManageForeignRoutingPolicyRules=' /etc/systemd/networkd.conf; then
             sed -i 's/^#\?ManageForeignRoutingPolicyRules=.*/ManageForeignRoutingPolicyRules=no/' \
@@ -651,8 +690,8 @@ EOF
     # 才会被删 —— 文件写下去，"下一次启动"这个点就已经被堵住了，不管那次启动是
     # 无人值守更新触发的还是重启触发的。现在手动重启只是白冒一次断网的风险。
     # 想亲眼验证：systemctl restart systemd-networkd 之后看 ip rule 还在不在。
-    if systemd-analyze cat-config systemd/networkd.conf 2>/dev/null \
-            | grep -q '^ManageForeignRoutingPolicyRules=no'; then
+    if has_out '^ManageForeignRoutingPolicyRules=no' \
+            systemd-analyze cat-config systemd/networkd.conf; then
         ok "已配置 ManageForeignRoutingPolicyRules=no（下次 networkd 启动起生效）"
     else
         bad "配置没被 systemd 认到 —— 查 systemd 版本"
@@ -679,7 +718,7 @@ else
     bad "xray-redir 没起来 —— journalctl -u xray-redir -n 50 --no-pager"
 fi
 
-if ss -lun 2>/dev/null | grep -qE "[:.]${L2TP_PORT}[[:space:]]"; then
+if has_out -E "[:.]${L2TP_PORT}[[:space:]]" ss -lun; then
     ok "UDP ${L2TP_PORT} 在监听（L2TP）"
 else
     bad "UDP ${L2TP_PORT} 没在监听"
@@ -687,34 +726,34 @@ else
     [[ -c /dev/ppp ]] || printf '      ↳ 没有 /dev/ppp —— modprobe ppp_generic\n'
 fi
 
-if ss -lnt 2>/dev/null | grep -qE "[:.]${TCP_PORT}[[:space:]]" \
-   && ss -lun 2>/dev/null | grep -qE "[:.]${UDP_PORT}[[:space:]]"; then
+if has_out -E "[:.]${TCP_PORT}[[:space:]]" ss -lnt \
+   && has_out -E "[:.]${UDP_PORT}[[:space:]]" ss -lun; then
     ok "xray 在听 TCP ${TCP_PORT} / UDP ${UDP_PORT}"
 else
     bad "xray 的入口端口没在听（config.json 或进程有问题）"
 fi
 
-if iptables -t nat -S PREROUTING | grep -qF -- "--to-ports ${TCP_PORT}"; then
+if has_out -F "--to-ports ${TCP_PORT}" iptables -t nat -S PREROUTING; then
     ok "nat PREROUTING 有 REDIRECT → ${TCP_PORT}"
 else
     bad "nat PREROUTING 缺 REDIRECT"
 fi
 
-if iptables -t mangle -S PREROUTING | grep -qF -- "--on-port ${UDP_PORT}"; then
+if has_out -F "--on-port ${UDP_PORT}" iptables -t mangle -S PREROUTING; then
     ok "mangle PREROUTING 有 TPROXY → ${UDP_PORT}"
 else
     bad "mangle PREROUTING 缺 TPROXY"
 fi
 
 # 这两条查的是【重启之后还在不在】，不是【现在在不在】。
-if ip rule show | grep -q 'fwmark 0x1 lookup 100'; then
+if has_out 'fwmark 0x1 lookup 100' ip rule show; then
     ok "ip rule 有 fwmark 0x1 lookup 100"
 else
     bad "ip rule 缺 fwmark 0x1 lookup 100 —— UDP 会被打到公网出口，回包对不上"
     printf '      ↳ $REDIR_SH apply 补一条，并确认 networkd 那个配置真的生效了\n'
 fi
 
-if ip route show table 100 2>/dev/null | grep -qE '^(local default|local 0\.0\.0\.0/0)'; then
+if has_out -E '^(local default|local 0\.0\.0\.0/0)' ip route show table 100; then
     ok "table 100 有 local 路由"
 else
     bad "table 100 缺 local 路由 —— mark 过的包无处可去"
@@ -733,8 +772,8 @@ else
 fi
 
 if systemctl is-active --quiet systemd-networkd; then
-    if systemd-analyze cat-config systemd/networkd.conf 2>/dev/null \
-            | grep -q '^ManageForeignRoutingPolicyRules=no'; then
+    if has_out '^ManageForeignRoutingPolicyRules=no' \
+            systemd-analyze cat-config systemd/networkd.conf; then
         ok "networkd 不会清理外来策略规则（重启/升级后 fwmark 规则不再丢）"
     else
         bad "ManageForeignRoutingPolicyRules 没生效 —— 下次 networkd 重启会清掉 ip rule"
