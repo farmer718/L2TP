@@ -154,16 +154,9 @@ LOCAL_IP="${VPN_NET}.1"
 IP_RANGE="${VPN_NET}.10-${VPN_NET}.50"
 VPN_CIDR="${VPN_NET}.0/24"
 
-# ---------------------------------------------------------------- 本机公网段
-
-# 排除「落地机自己所在网段」，否则发给同网段（网关、邻居）的包会被绕进 xray。
-# `ip route show scope link` 里内核已经把网段算好了（103.227.227.0/24 dev ens17
-# proto kernel scope link src ...），不用自己做按位与。RFC1918 排除掉。
-# 推不出来不算错：--dst-type LOCAL 那条仍然护住本机。
-BOXLOCAL="$(ip -4 route show scope link 2>/dev/null \
-    | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}\/[0-9]+$/ {print $1}' \
-    | grep -vE '^(10\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)' \
-    | paste -sd' ' - || true)"
+# 不做「本机网段」例外。落地机可能只有一个上游交换机分配的私网地址，
+# 那时推出来的网段要么是空的、要么是跟这里无关的私网段，加它只是多一层不确定。
+# 发给本机自己的流量由 addrtype LOCAL 挡住，够用了。
 
 echo
 echo "=========================================="
@@ -174,7 +167,6 @@ echo " 客户端池   : ${IP_RANGE}"
 echo " L2TP 端口  : ${L2TP_PORT}  (UDP)"
 echo " MTU / MRU  : ${MTU}"
 echo " xray 入口  : TCP ${TCP_PORT} (REDIRECT) / UDP ${UDP_PORT} (TPROXY)"
-echo " 本机网段   : ${BOXLOCAL:-（推不出来，只排除本机地址）}"
 if [[ -n $OLD_NET && $OLD_NET != "$VPN_CIDR" ]]; then
     echo " ⚠ 旧网段   : ${OLD_NET}  →  本次改成 ${VPN_CIDR}（旧规则先删掉）"
 fi
@@ -455,7 +447,6 @@ ok "config.json（TCP ${TCP_PORT} / UDP ${UDP_PORT}）"
     echo 'set -u'
     echo
     printf 'SUBNET=%q\n'   "$VPN_CIDR"
-    printf 'BOXLOCAL=%q\n'  "$BOXLOCAL"
     printf 'TCP_PORT=%s\n'  "$TCP_PORT"
     printf 'UDP_PORT=%s\n'  "$UDP_PORT"
     cat <<'BODY'
@@ -471,20 +462,14 @@ del_one() {
 }
 
 apply() {
-  # TCP -> REDIRECT。三条 RETURN 必须排在动作规则前面。
+  # TCP -> REDIRECT。两条 RETURN 必须排在动作规则前面。
   apply_one nat PREROUTING -s "$SUBNET" -m addrtype --dst-type LOCAL -j RETURN
   apply_one nat PREROUTING -s "$SUBNET" -d 10.0.0.0/8 -j RETURN
-  for net in $BOXLOCAL; do
-    apply_one nat PREROUTING -s "$SUBNET" -d "$net" -j RETURN
-  done
   apply_one nat PREROUTING -s "$SUBNET" -p tcp -j REDIRECT --to-ports "$TCP_PORT"
 
   # UDP -> TPROXY（UDP 的 REDIRECT 拿不到原始目的地址，只能用 TPROXY）
   apply_one mangle PREROUTING -s "$SUBNET" -m addrtype --dst-type LOCAL -j RETURN
   apply_one mangle PREROUTING -s "$SUBNET" -d 10.0.0.0/8 -j RETURN
-  for net in $BOXLOCAL; do
-    apply_one mangle PREROUTING -s "$SUBNET" -d "$net" -j RETURN
-  done
   apply_one mangle PREROUTING -s "$SUBNET" -p udp -j TPROXY --on-port "$UDP_PORT" --tproxy-mark 0x1/0x1
 
   # 两个监听端口只对隧道内开放
@@ -500,16 +485,10 @@ apply() {
 
 remove() {
   del_one nat PREROUTING -s "$SUBNET" -p tcp -j REDIRECT --to-ports "$TCP_PORT"
-  for net in $BOXLOCAL; do
-    del_one nat PREROUTING -s "$SUBNET" -d "$net" -j RETURN
-  done
   del_one nat PREROUTING -s "$SUBNET" -d 10.0.0.0/8 -j RETURN
   del_one nat PREROUTING -s "$SUBNET" -m addrtype --dst-type LOCAL -j RETURN
 
   del_one mangle PREROUTING -s "$SUBNET" -p udp -j TPROXY --on-port "$UDP_PORT" --tproxy-mark 0x1/0x1
-  for net in $BOXLOCAL; do
-    del_one mangle PREROUTING -s "$SUBNET" -d "$net" -j RETURN
-  done
   del_one mangle PREROUTING -s "$SUBNET" -d 10.0.0.0/8 -j RETURN
   del_one mangle PREROUTING -s "$SUBNET" -m addrtype --dst-type LOCAL -j RETURN
 
