@@ -1,9 +1,10 @@
 # L2TP & NAT 部署脚本
 
-两个脚本，各一条命令，重跑幂等。
+两个脚本，各一条命令。**落地脚本是先删后装**：跑一次 = 把这台机器上的 L2TP / xray
+配置全部删掉，再从零装一遍。在线隧道会断，跑完即用，不留备份。
 
-落地脚本**每次运行都会停下来问一次 VPN_ID**：直接回车 = 沿用当前网段（就是幂等重跑），
-输个数字 = 换网段。不想要这一步就在命令行上直接给，那就不会再问。
+落地脚本**每次运行都会停下来问一次 VPN_ID**：直接回车 = 沿用当前网段，
+输个数字 = 换网段（旧网段的 NAT 规则会被一起删掉）。不想要这一步就在命令行上直接给。
 
 ## ① 落地机 —— L2TP 服务端
 
@@ -29,7 +30,8 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 | Debian / Ubuntu | 走 apt；需要 systemd |
 | pppd + `/dev/ppp` | `apt` 装 `xl2tpd` 时会带上 `ppp`。**不需要** `l2tp_ppp` 内核模块 |
 | root | 脚本会检查，不是 root 直接拒绝 |
-| 能连软件源 | 装包用 |
+| 能连软件源 | 装包用（`curl` / `unzip` 也会一起装上） |
+| 能连 GitHub | 只在 `/opt/xray-redir/xray` 缺失或版本不是 26.3.27 时才下载（~36MB，`XTLS/Xray-core`） |
 
 内核 ≥4.9 才有 BBR；低了只是没加速，不影响 L2TP。
 
@@ -43,6 +45,8 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
 | MTU / MRU | 1420 |
 | 用户名 | farmer |
 | 密码 | chp1qaz!QAZ |
+| xray 版本 | 26.3.27，装在 `/opt/xray-redir` |
+| 接管入口 | TCP 12345（REDIRECT）/ UDP 12346（TPROXY）→ `freedom` 直出 |
 
 `VPN_ID` 决定用哪个 `10.10.x.0/24` 网段。**每次运行都会问一次**，默认值按这个顺序取：
 
@@ -59,12 +63,18 @@ bash <(curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/nat_a_entr
  VPN_ID (1-200):
 ```
 
-命令行给了参数（`sudo ./l2tp_deploy.sh 12`）就不再问。换网段**不会删旧网段的 NAT 规则**。
+命令行给了参数（`sudo ./l2tp_deploy.sh 12`）就不再问。换网段**会删掉旧网段的 NAT 规则**
+—— 这台机器上的旧配置一律不留。
 
 ### 跑完会自检
 
-服务 active / 端口监听 / `ip_forward` / NAT 规则 / unit 是否带 `Restart=always` /
-unit 是否声明 `RuntimeDirectory=xl2tpd` / **`chap-secrets` 里有没有账号**，
+L2TP 那层：服务 active / 端口监听 / `ip_forward` / NAT 规则 / unit 是否带 `Restart=always` /
+unit 是否声明 `RuntimeDirectory=xl2tpd` / **`chap-secrets` 里有没有账号**。
+
+xray 那层：服务 active / 12345 与 12346 在听 / nat 有 REDIRECT / mangle 有 TPROXY /
+**`ip rule` 里有 `fwmark 0x1 lookup 100`** / table 100 有 local 路由 /
+**规则有没有真的落到 `/etc/iptables/rules.v4`** / networkd 那个开关真的生效了没有。
+
 有 ✘ 就以**非 0** 退出。不会再出现"打印了部署完成但其实没成"。
 
 后两条是**回归防线**，不是当下的保险 —— 它们要防的 bug 都在更早的写入步骤里，
@@ -98,29 +108,26 @@ curl -sL https://raw.githubusercontent.com/farmer718/L2TP/main/l2tp_deploy.sh | 
 
 最小化系统如果连 `curl` 都没有，先 `apt-get install -y curl`（或 `wget` 下来再跑）。
 
-## 已经在跑老脚本的机器，直接跑新的会怎样
+## 已经在跑的机器上重跑会怎样
 
-**直接一键跑就行。** 老机器上没有 `/etc/l2tp-deploy.conf`，脚本会从现存的
-`/etc/xl2tpd/xl2tpd.conf` 里自动认出正在用的网段，摆成提问的默认值 —— **回车即保持原样**，
-所以不会填错。想换网段就当场输数字，或者显式传：`sudo ./l2tp_deploy.sh 12`。
+**先删后装。** 不管这台机器上装的是哪个版本的脚本，新脚本都先把它清空：
 
-（以前是"认出来就直接用、压根不问"。改成必问是因为换网段会换掉客户端的 IP，
-这种事让脚本替你决定不合适。）
-
-| 项目 | 结果 |
+| 删掉的 | 说明 |
 |---|---|
-| 在线隧道 | ⚠️ **断一次**（几秒，客户端会自动重连）—— 换 native unit 必须重启 |
-| `xl2tpd.conf` | 网段/端口不变，改写前备份到 `/var/backups/l2tp-deploy/` |
-| `options.xl2tpd` | 多出 `mtu/mru 1420`，对实测的 1420 是零改动 |
-| `chap-secrets` | ✅ 有账号就**原样保留、一个字不动**；一个账号都没有才补上默认的 |
-| sysctl | 值相同，无变化。老脚本写在 `/etc/sysctl.conf` 的行留着，无害 |
-| `/etc/init.d/xl2tpd` + `rc*.d` 软链 | 留着但失效（`/etc/systemd/system/` 里的 native unit 优先） |
-| NAT 规则 | ⚠️ 老规则没带 `l2tp-deploy` 标记，认不出来 → **会多出一条重复的 MASQUERADE**，无害，脚本会报出来并给出删除命令 |
+| `xray-redir` / `xl2tpd` 两个服务 | 停掉，取消 enable |
+| iptables 里的 REDIRECT / TPROXY / DROP / 旧网段 MASQUERADE | 用旧防火墙脚本自己的 `remove` 精确删，不 flush 任何链 |
+| `/opt/xray-redir` | 整个目录，连 xray 内核一起删，重装时重新下载 |
+| 旧 unit / `xl2tpd.conf` / `options.xl2tpd` / 旧 needrestart 黑名单 / 旧 sysctl | 全部删掉重写 |
 
-那唯一会断的一下没法避免：`Restart=always` 的 native unit 要生效就得重启一次。
-想先看清楚再动手：`sudo DRY_RUN=1 ./l2tp_deploy.sh 11` 只打印计划。
+网段从现存 `xl2tpd.conf` 里认出来当提问的默认值，回车即沿用。
 
-出问题要回滚：`/var/backups/l2tp-deploy/` 里是**第一次跑本脚本之前**的原件。
+**唯一不删的是 `/etc/ppp/chap-secrets`** —— 里面是账号密码，不是拓扑状态，
+删了就得知道原账号才恢复得回来。有有效账号就一个字不动，一个账号都没有才写默认账号。
+
+代价：**在线隧道断一次**（几秒，客户端会自动重连），跑的那一刻正在传的连接也会断。
+脚本每次都重启服务，不判断配置有没有变。想先看清楚：`sudo DRY_RUN=1 ./l2tp_deploy.sh 11`。
+
+没有备份，没有回滚目录。要换什么就重跑。
 
 ## chap-secrets 那个坑（2026-09-28 修）
 
@@ -217,10 +224,59 @@ chmod 600 /etc/ppp/chap-secrets
 
 - **NAT 规则只增不删**，绝不 `-F POSTROUTING`（那会连 docker 和其他转发规则一起清掉）。
 
+- **部署 xray 接管层，把隧道里的流量全部重新发起。**
+
+  两个 `dokodemo-door` 入口 + 一个 `freedom` 出站。TCP 靠 `nat REDIRECT` → 12345，
+  UDP 靠 `mangle TPROXY --on-port 12346 --tproxy-mark 0x1/0x1` → 12346。
+  客户端发什么，落地机就用自己的协议栈重新发起一遍，所以多个客户端在对面看来是同一台主机。
+
+  UDP 必须用 TPROXY，不能用 REDIRECT —— REDIRECT 不给原始目的地址，`followRedirect`
+  就无从得知该连哪儿。TPROXY 又依赖两条手工状态：`ip rule add fwmark 1 lookup 100`
+  和 `ip route add local 0.0.0.0/0 dev lo table 100`。
+
+  **2026-10-22 的故障就出在这里。** unattended-upgrade 升 liblzma5 触发 needrestart
+  重启了 systemd-networkd，而 systemd 255 的 networkd 默认
+  `ManageForeignRoutingPolicyRules=yes` —— 启动时把"外来"策略规则删了。
+  table 100 的路由没被删，于是只剩"路由对、规则没了"的半死状态：包被 mark 了却没有
+  规则去查 table 100，从主表用公网地址出去，回包对不上。表现是 **UDP 全死、TCP 全活**
+  （TCP 走 iptables REDIRECT，networkd 不碰 iptables），和 DNS 故障长得一模一样。
+
+  脚本把 `ManageForeignRoutingPolicyRules=no` 写进 networkd 配置。**写完不用重启
+  networkd** —— 规则只在 networkd 启动那一刻才会被删，而配置是每次启动都读的，
+  文件写下去，"下一次启动"这个点就已经堵住了，不管那次启动是升级触发还是重启触发。
+  想亲眼看：`systemctl restart systemd-networkd` 之后 `ip rule show` 里那条还在不在。
+
+- **重启后照样生效，靠三件事叠起来。**
+
+  ① iptables 规则落 `/etc/iptables/rules.v4`，开机由 netfilter-persistent 恢复；
+  ② `ip rule` / table 100 不在 iptables 里，只能由 `xray-redir` 的 `ExecStartPre`
+     在每次启动时补 —— 所以它带 `Restart=always` + `StartLimitIntervalSec=0`；
+  ③ networkd 不会再清理它。
+
+  `netfilter-persistent save` 必须排在 xray 铺规则**之后**，否则 rules.v4 里没有接管规则，
+  开机窗口内流量会直接 MASQUERADE 出去 —— 那是漏，不是断。
+
 ## 客户端连接
 
 系统自带 VPN 客户端，选 L2TP/IPSec（注意：本脚本只部署 L2TP，**不含 IPSec**）。
 端口填 **17001**。
+
+拨上之后，客户端发的所有 IPv4 流量都会被 xray 接住，从这台落地机重新发起。
+例外只有三条：发给本机的（`addrtype LOCAL`）、发给 `10.0.0.0/8` 的、
+发给落地机自己所在公网段的 —— 这三类直连，不进 xray。
+
+排障先看这几条：
+
+```bash
+ip rule show | grep fwmark                  # 必须有 0x1 lookup 100
+ip route show table 100                     # 必须有 local default dev lo
+/usr/local/sbin/l2tp-redir-firewall.sh status
+journalctl -u xray-redir -n 30 --no-pager
+```
+
+**别用 `ss` 看推流那根连接。** TPROXY 转发的 UDP 会话不出现在 `ss` 里，
+要看流量用 `tcpdump -ni <网卡> 'udp and host <ingest>'`，或者
+`journalctl -u xray-redir | grep accepted`。
 
 ## nat_a_entry.sh 用法
 
