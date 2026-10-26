@@ -92,6 +92,28 @@ has_out() {   # has_out [-E|-F] <模式> <命令...>
     grep $opt -q -- "$pat" <<< "$out"
 }
 
+# 本脚本加的 MASQUERADE 都带 comment 标签。重装时按标签扫一遍全删，不看网段。
+# 为什么不能只按网段删：旧网段的记录可能早就没了 —— 2026-10-26 的 210.68.95.228，
+# /etc/l2tp-deploy.conf 和 xl2tpd.conf 都已经改写成 20，18 天前留下的 10.10.19.0/24
+# 变成一条无记录的孤儿规则，按网段永远够不着它。标签是唯一稳定的线索，
+# 而且带了标签就一定是本脚本加的，删它不会误伤。
+sweep_tagged_masq() {   # 输出：删掉的条数
+    local n=0 line spec
+    while :; do
+        line="$(iptables -t nat -S POSTROUTING 2>/dev/null \
+                | grep -F -- "-m comment --comment $TAG" \
+                | grep -F -- "-j MASQUERADE" | head -n1 || true)"
+        [[ -n $line ]] || break
+        spec="${line#-A POSTROUTING }"
+        # 不 eval：值里出现引号说明形状超出预期，宁可停下也不乱拆词
+        case "$spec" in *[\"\']*) break ;; esac
+        iptables -t nat -D POSTROUTING $spec 2>/dev/null || break
+        n=$((n + 1))
+        (( n >= 64 )) && break      # 删了还在，说明 iptables 行为不对，别转圈
+    done
+    printf '%s' "$n"
+}
+
 # ---------------------------------------------------------------- 前置检查
 
 [[ $EUID -eq 0 ]] || die "请用 root 执行：sudo $0"
@@ -102,10 +124,12 @@ has_out() {   # has_out [-E|-F] <模式> <命令...>
 # 换网段时（`./l2tp_deploy.sh 12`，机器上还是 11）必须删旧的，
 # 拿新值去删等于什么都没删。
 #
+# 这份名单只用来删【老脚本留下的、没打标签的】MASQUERADE —— 本脚本自己打的
+# 带 comment 标签，由 sweep_tagged_masq 按标签直接扫掉，不需要网段。
+#
 # 两个来源都要看，不能二选一：/etc/l2tp-deploy.conf 记的是「上次跑到哪一步」，
 # /etc/xl2tpd/xl2tpd.conf 记的是「实际在用的网段」，两者可能对不上 ——
-# 2026-10-26 的 210.68.95.228 就是这样：conf 里写着 20，机器实际跑在 19，
-# 只信 conf 就把 10.10.19.0/24 那条 MASQUERADE 原封不动留在了机器上。
+# 2026-10-26 的 210.68.95.228 就是这样：conf 里写着 20，机器实际跑在 19。
 # 取并集：多删一条不存在的规则是空操作，漏删一条就会一直留着。
 PREV_IDS=""
 _prev="$(conf_get VPN_ID)"
@@ -260,18 +284,20 @@ if [[ -x $REDIR_SH ]]; then
     ok "已用旧脚本撤掉 REDIRECT/TPROXY/ip rule"
 fi
 
-# NAT：按旧网段精确删。两种形状都试——带 comment 的（本脚本）和不带的（老脚本）。
+# NAT：分两路删。
+# 带标签的（本脚本）按标签全删 —— 网段换了、记录丢了都不要紧，标签在就能删掉。
+n="$(sweep_tagged_masq)"
+(( n > 0 )) && ok "已删掉带 ${TAG} 标签的 ${n} 条 MASQUERADE"
+
+# 不带的（老脚本）只能按网段删，所以还得靠 OLD_NETS 这份记录。
 if [[ -n $OLD_NETS ]]; then
     n=0
     for _net in $OLD_NETS; do
-        while iptables -t nat -D POSTROUTING -s "$_net" -m comment --comment "$TAG" -j MASQUERADE 2>/dev/null; do
-            n=$((n + 1))
-        done
         while iptables -t nat -D POSTROUTING -s "$_net" -j MASQUERADE 2>/dev/null; do
             n=$((n + 1))
         done
     done
-    (( n > 0 )) && ok "已删掉旧网段的 ${n} 条 MASQUERADE（${OLD_NETS}）"
+    (( n > 0 )) && ok "已删掉旧网段的 ${n} 条无标签 MASQUERADE（${OLD_NETS}）"
 fi
 
 rm -f "$XRAY_UNIT" "$REDIR_SH" "$UNIT" "$XL_CONF" "$PPP_CONF" "$NR_CONF" "$SYSCTL_CONF"
