@@ -256,6 +256,30 @@ chmod 600 /etc/ppp/chap-secrets
   `netfilter-persistent save` 必须排在 xray 铺规则**之后**，否则 rules.v4 里没有接管规则，
   开机窗口内流量会直接 MASQUERADE 出去 —— 那是漏，不是断。
 
+## 机器上已经装着 xray / sing-box 会怎样
+
+**内核共存没问题。** 本脚本的 xray 放在 `/opt/xray-redir/xray`，unit 叫 `xray-redir`，
+跟系统的 `xray.service` / `sing-box.service`、跟 `/usr/local/bin/xray` 各过各的，
+互不覆盖、互不停止。
+
+会撞上的只有三件事：
+
+| 冲突 | 后果 | 脚本怎么处理 |
+|---|---|---|
+| 12345 / 12346 / 17001 被占 | `xray-redir` 起不来；它带 `Restart=always` + `StartLimitIntervalSec=0`，会每 2 秒重启一次永远刷日志 | **擦除之前**就检查，撞了就退出，什么都不动 |
+| 已有针对同一网段的 TPROXY / REDIRECT | iptables 顺序决定谁吃流量，可能双层接管或漏接 | 不自动处理 |
+| 已有 `fwmark 1 lookup 100` | 本脚本会往 table 100 补 `local default dev lo`，把原有的 tun 默认路由顶掉 | 擦除后检测到就报出来，并把 table 100 打出来 |
+
+第三条最阴 —— **sing-box 的 tun 默认就是 `fwmark 1` + `table 100`**。跑之前先看一眼：
+
+```bash
+ss -lntup | grep -E ':(12345|12346|17001)[[:space:]]'
+ip rule show | grep fwmark
+ip route show table 100
+```
+
+前两条干净（端口没人在听、`ip rule` 里没有 fwmark、table 100 是空的）就可以放心跑。
+
 ## 客户端连接
 
 系统自带 VPN 客户端，选 L2TP/IPSec（注意：本脚本只部署 L2TP，**不含 IPSec**）。

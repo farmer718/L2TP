@@ -175,6 +175,35 @@ echo " 会先删掉这台机器上所有旧的 L2TP / xray 配置，再重装。
 echo " 在线隧道会断，服务会被重启；不留备份。"
 echo "=========================================="
 
+# ---------------------------------------------------------------- 0. 端口占用
+
+# 已经装着别的 xray / sing-box 不影响 —— 本脚本的内核在 /opt/xray-redir，
+# unit 叫 xray-redir，跟系统的 xray.service / sing-box.service 各过各的。
+# 唯一会正面撞上的是端口：撞了 xray-redir 起不来，而 Restart=always +
+# StartLimitIntervalSec=0 会让它每 2 秒重启一次、永远刷日志，自检也只会报 ✘。
+# 所以放在擦除之前查，撞了就什么都不动直接退。
+step "检查端口占用"
+
+for p in "$L2TP_PORT" "$TCP_PORT" "$UDP_PORT"; do
+    owner="$(ss -lntup 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | head -n1 || true)"
+    if [[ -z $owner ]]; then
+        continue
+    fi
+    case "$owner" in
+        *"$XRAY_DIR/xray"*|*xl2tpd*)
+            # 重跑时这两个是自己上一轮留下的，第 1 步会先停掉
+            ok "端口 ${p} 是本脚本自己的服务占着，稍后会被重启"
+            ;;
+        *)
+            die "端口 ${p} 已被占用，先处理掉再跑：
+       ${owner}
+     这不是本脚本铺的东西 —— 常见是机器上已有的 xray / sing-box 透明代理。
+     要么换端口（脚本顶部 TCP_PORT/UDP_PORT），要么先停掉那个服务。"
+            ;;
+    esac
+done
+ok "${L2TP_PORT} / ${TCP_PORT} / ${UDP_PORT} 检查完毕"
+
 if [[ $DRY_RUN == 1 ]]; then
     echo
     echo "DRY_RUN=1 —— 只显示计划，未做任何改动。"
@@ -214,6 +243,17 @@ rm -f "$XRAY_DIR/config.json"
 systemctl daemon-reload
 ok "已删掉旧 unit / 配置 / 旧防火墙脚本（xray 内核保留）"
 warn "chap-secrets 没动（要保留账号）；有重复账号的话自己看一眼 $CHAP_SECRETS"
+
+# 自己的规则已经撤干净了，这时候还剩 fwmark 1 lookup 100 就是别人的。
+# sing-box 的 tun 默认就用 fwmark 1 + table 100，撞上会出事：本脚本会往同一个表里
+# 补一条 local default dev lo，把它原来的 tun 默认路由顶掉。
+# 只报不拦 —— 擦除已经做完了，拦下来也回不去。
+if ip rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100'; then
+    warn "ip rule 里还有 fwmark 1 lookup 100 —— 不是本脚本的（本脚本的刚被删掉）"
+    warn "可能来自别的透明代理（sing-box tun 默认就是 fwmark 1 + table 100）"
+    warn "table 100 现在的内容，脚本会往里加 local default dev lo："
+    ip route show table 100 2>/dev/null | sed 's/^/        /' || true
+fi
 
 # ---------------------------------------------------------------- 2. 依赖
 
