@@ -496,6 +496,61 @@ case "$(uname -m)" in
 esac
 XURL="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/${XZIP}"
 
+# 下载按三级退，前两级都是 GitHub 自己：
+#   1) 官方 download 地址 —— 正常情况就这一条。
+#   2) GitHub API 换签名直链 —— 2026-11-08 实测：github.com 的 releases 前端
+#      整条路径 504（连 /releases/latest 都 504、换个 edge 区域也一样），
+#      而 api.github.com 照常应答，它 302 到 release-assets.githubusercontent.com
+#      的签名地址拿到的是同一份资产。前端挂了不等于资产挂了，换个入口就下得动。
+#   3) 镜像前缀 —— 前两条都够不着才用。第三方转发，多一层不可信：只在
+#      GitHub 自己整片不可达时兜底，能等就等 GitHub 恢复。
+XRAY_MIRRORS=(
+    "https://gh-proxy.com/"
+    "https://ghproxy.net/"
+)
+
+# 走 API 把资产换成签名直链，失败返回非零（调用方自己去试下一条）。
+api_asset_url() {
+    local rel id
+    rel="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/tags/v${XRAY_VER}" 2>/dev/null)" || return 1
+    # 资产对象里 id 在 name 之前、browser_download_url 在最后：按行记下最近出现的
+    # 资产 url，再拿同一段里最后那行 download_url 比对文件名。不靠 jq，最小化系统没有。
+    id="$(printf '%s\n' "$rel" | awk -v w="$XZIP" '
+        /"url": "https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ { u = $0 }
+        /browser_download_url/ && index($0, "/" w "\"") { print u; exit }
+    ' | sed -n 's|.*assets/\([0-9]\{1,\}\).*|\1|p')"
+    [[ -n $id ]] || return 1
+    # Accept: application/octet-stream 让 API 直接 302 到资产，而不是回 JSON 元数据。
+    # 这里不能带 -L：curl 跟完跳转之后 %{redirect_url} 是空的。
+    curl -sS -o /dev/null -w '%{redirect_url}' \
+        -H 'Accept: application/octet-stream' \
+        --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/assets/${id}" 2>/dev/null
+}
+
+download_xray() {
+    local out=$1 u
+    if curl -fsSL --connect-timeout 20 --max-time 300 -o "$out" "$XURL"; then
+        ok "xray 压缩包：github.com"
+        return 0
+    fi
+    warn "官方地址不通，改用 GitHub API 取签名直链"
+    u="$(api_asset_url)" || u=""
+    if [[ -n $u ]] && curl -fsSL --connect-timeout 20 --max-time 300 -o "$out" "$u"; then
+        ok "xray 压缩包：release-assets（经 API 解析）"
+        return 0
+    fi
+    for u in "${XRAY_MIRRORS[@]}"; do
+        warn "GitHub 两条路都不通，试镜像：$u"
+        if curl -fsSL --connect-timeout 20 --max-time 300 -o "$out" "${u}${XURL}"; then
+            ok "xray 压缩包：${u}（第三方镜像）"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # 版本一致就不动它；不一致（或压根没有）才重下。`|| true` 是给 xray 不存在时
 # 那个 127 准备的 —— 否则 pipefail + 裸赋值会让 set -e 静默退出。
 CUR_VER="$("$XRAY_DIR/xray" version 2>/dev/null | awk 'NR==1{print $2}' || true)"
@@ -504,8 +559,11 @@ if [[ $CUR_VER == "$XRAY_VER" ]]; then
 else
     [[ -n $CUR_VER ]] && warn "现装的是 v${CUR_VER}，要的是 v${XRAY_VER}，重新下载"
     t="$(mktemp -d)"
-    curl -fsSL --connect-timeout 20 -o "$t/x.zip" "$XURL" \
-        || die "下载 xray 失败：$XURL"
+    download_xray "$t/x.zip" \
+        || die "下载 xray 失败：官方地址、API 直链、镜像都没下来
+       $XURL
+       ── GitHub 自身故障时（releases 前端 504），等它恢复后重跑本脚本即可：
+          脚本本身就是破坏性重装，重跑不会留下半套东西。"
     unzip -oq "$t/x.zip" -d "$XRAY_DIR" || die "解包 xray 失败"
     rm -rf "$t"
     chmod +x "$XRAY_DIR/xray"
